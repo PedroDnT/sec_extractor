@@ -22,6 +22,7 @@ import time
 import sys
 from typing import Dict, List, Optional, Tuple
 import json
+from io import StringIO
 
 class SECQuarterlyExtractor:
     """
@@ -162,12 +163,15 @@ class SECQuarterlyExtractor:
             # Construct URL
             url = f"https://www.sec.gov/Archives/edgar/data/{self.cik}/{acc_no}/{primary_document}"
             
+            print(f"      📥 Downloading {primary_document}...")
             response = requests.get(url, headers=self.headers, timeout=30)
-            time.sleep(0.2)  # Be respectful to SEC servers
+            time.sleep(1.0)  # Increased delay to be respectful to SEC servers
             
             if response.status_code == 200:
+                print(f"      ✅ Download complete")
                 return response.text
             else:
+                print(f"      ❌ Download failed (Status: {response.status_code})")
                 return None
                 
         except Exception as e:
@@ -214,8 +218,8 @@ class SECQuarterlyExtractor:
             # Check if this table matches our statement type
             if any(keyword in table_text for keyword in keywords[statement_type]):
                 try:
-                    # Try to parse with pandas
-                    dfs = pd.read_html(str(table))
+                    # Try to parse with pandas (fix FutureWarning)
+                    dfs = pd.read_html(StringIO(str(table)))
                     
                     if dfs and len(dfs) > 0:
                         df = dfs[0]
@@ -253,7 +257,11 @@ class SECQuarterlyExtractor:
         
         return f"{quarter}Q{fiscal_year:02d}"
     
-    def process_dataframe(self, df: pd.DataFrame, period: str) -> pd.DataFrame:
+    def extract_period_date(self, filing: Dict) -> str:
+        """Extract the fiscal period end date from filing"""
+        return filing['report_date']  # Already in YYYY-MM-DD format
+    
+    def process_dataframe(self, df: pd.DataFrame, period: str, period_date: str) -> pd.DataFrame:
         """Process and clean the extracted dataframe"""
         if df is None:
             return None
@@ -276,10 +284,13 @@ class SECQuarterlyExtractor:
             if len(numeric_cols) == 0:
                 return None
             
+            # Create column name with period and date (format: "1Q22 (2022-04-30)")
+            column_name = f"{period} ({period_date})"
+            
             # Take first column as line items and first numeric column as values
             result = pd.DataFrame({
                 'Line Item': df.iloc[:, 0],
-                period: df[numeric_cols[0]]
+                column_name: df[numeric_cols[0]]
             })
             
             return result
@@ -313,41 +324,59 @@ class SECQuarterlyExtractor:
         
         print(f"\n📊 Processing {len(filings)} filings...\n")
         
-        for i, filing in enumerate(filings, 1):
-            period = self.extract_period_label(filing)
+        # Process in batches to avoid overwhelming
+        batch_size = 5
+        for batch_start in range(0, len(filings), batch_size):
+            batch_end = min(batch_start + batch_size, len(filings))
+            print(f"🔄 Processing batch {batch_start//batch_size + 1}/{(len(filings)-1)//batch_size + 1} (filings {batch_start+1}-{batch_end})")
             
-            print(f"[{i}/{len(filings)}] {filing['form']} - {filing['report_date']} → {period}")
+            for i in range(batch_start, batch_end):
+                filing = filings[i]
+                period = self.extract_period_label(filing)
+                period_date = self.extract_period_date(filing)
+                
+                print(f"[{i+1}/{len(filings)}] {filing['form']} - {filing['report_date']} → {period}")
+                
+                try:
+                    # Download filing with timeout
+                    html = self.download_filing(filing['accession_number'], filing['primary_document'])
+                    
+                    if not html:
+                        print(f"      ❌ Download failed")
+                        continue
+                    
+                    # Extract each statement
+                    income_df = self.extract_financial_table(html, 'income')
+                    balance_df = self.extract_financial_table(html, 'balance')
+                    cashflow_df = self.extract_financial_table(html, 'cashflow')
+                    
+                    # Process and store
+                    if income_df is not None:
+                        processed = self.process_dataframe(income_df, period, period_date)
+                        if processed is not None:
+                            income_data[period] = processed
+                            print(f"      ✅ Income Statement")
+                    
+                    if balance_df is not None:
+                        processed = self.process_dataframe(balance_df, period, period_date)
+                        if processed is not None:
+                            balance_data[period] = processed
+                            print(f"      ✅ Balance Sheet")
+                    
+                    if cashflow_df is not None:
+                        processed = self.process_dataframe(cashflow_df, period, period_date)
+                        if processed is not None:
+                            cashflow_data[period] = processed
+                            print(f"      ✅ Cash Flow Statement")
+                            
+                except Exception as e:
+                    print(f"      ❌ Error processing filing: {e}")
+                    continue
             
-            # Download filing
-            html = self.download_filing(filing['accession_number'], filing['primary_document'])
-            
-            if not html:
-                print(f"      ❌ Download failed")
-                continue
-            
-            # Extract each statement
-            income_df = self.extract_financial_table(html, 'income')
-            balance_df = self.extract_financial_table(html, 'balance')
-            cashflow_df = self.extract_financial_table(html, 'cashflow')
-            
-            # Process and store
-            if income_df is not None:
-                processed = self.process_dataframe(income_df, period)
-                if processed is not None:
-                    income_data[period] = processed
-                    print(f"      ✅ Income Statement")
-            
-            if balance_df is not None:
-                processed = self.process_dataframe(balance_df, period)
-                if processed is not None:
-                    balance_data[period] = processed
-                    print(f"      ✅ Balance Sheet")
-            
-            if cashflow_df is not None:
-                processed = self.process_dataframe(cashflow_df, period)
-                if processed is not None:
-                    cashflow_data[period] = processed
-                    print(f"      ✅ Cash Flow Statement")
+            # Add extra delay between batches
+            if batch_end < len(filings):
+                print("⏸️  Pausing between batches...")
+                time.sleep(2.0)
         
         print("\n📊 Combining quarterly data...")
         
@@ -363,8 +392,17 @@ class SECQuarterlyExtractor:
         if not data_dict:
             return None
         
-        # Sort periods chronologically
-        periods = sorted(data_dict.keys(), key=lambda x: (int(x[2:]), int(x[0])))
+        # Sort periods chronologically by extracting the period label (before the date)
+        # Format is like "1Q22 (2022-04-30)" so we extract just "1Q22" for sorting
+        def sort_key(period_str):
+            # Extract just the period label (e.g., "1Q22" from "1Q22 (2022-04-30)")
+            period_label = period_str.split(' ')[0] if ' ' in period_str else period_str
+            # Parse quarter and year (e.g., "1Q22" -> quarter=1, year=22)
+            quarter = int(period_label[0])
+            year = int(period_label[2:4])
+            return (year, quarter)
+        
+        periods = sorted(data_dict.keys(), key=sort_key)
         
         # Start with first period
         result = data_dict[periods[0]].copy()
@@ -417,8 +455,7 @@ class SECQuarterlyExtractor:
         return output_file
 
 
-def extract_quarterly_financials(ticker: str, start_year: int = 2022, end_year: int = 2025,
-                                 output_file: str = None) -> str:
+def extract_quarterly_financials(ticker: str, start_year: int, end_year: int, output_file: str = None, test_mode: bool = False) -> str:
     """
     Main function to extract quarterly financials for any company
     
@@ -436,7 +473,7 @@ def extract_quarterly_financials(ticker: str, start_year: int = 2022, end_year: 
     """
     
     if output_file is None:
-        output_file = f"/mnt/user-data/outputs/{ticker.lower()}_quarterly_{start_year}_{end_year}.xlsx"
+        output_file = f"{ticker.lower()}_quarterly_{start_year}_{end_year}.xlsx"
     
     # Create extractor
     extractor = SECQuarterlyExtractor(ticker)

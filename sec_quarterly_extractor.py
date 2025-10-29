@@ -404,14 +404,16 @@ class SECQuarterlyExtractor:
         
         periods = sorted(data_dict.keys(), key=sort_key)
         
-        # Start with first period
-        result = data_dict[periods[0]].copy()
+        # Start with first period - use copy to avoid modifying original
+        result = data_dict[periods[0]][['Line Item']].copy()
         
-        # Add each subsequent period as a new column
-        for period in periods[1:]:
+        # Add each period as a new column (more memory efficient)
+        for period in periods:
             df = data_dict[period]
-            # Merge on 'Line Item'
-            result = result.merge(df, on='Line Item', how='outer')
+            # Get the column name (should be the period with date)
+            col_name = [c for c in df.columns if c != 'Line Item'][0]
+            # Merge just this column
+            result = result.merge(df[['Line Item', col_name]], on='Line Item', how='outer')
         
         return result
     
